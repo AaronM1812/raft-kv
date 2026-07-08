@@ -22,3 +22,25 @@
 **Next:**
 - Write PHASE1.md
 - Start storage.rs — in-memory HashMap with get, put, delete
+
+## 08/07/2026 — In-memory HashMap complete
+
+**What I did:**
+- Built the Storage struct in src/storage.rs wrapping a HashMap<String, Vec<u8>>
+- Implemented three methods: get, put, delete in an impl block
+- Wrote unit tests directly in storage.rs using #[cfg(test)] block
+- Tests passing: put and get, delete, get missing key
+
+**What I learned:**
+- Structs don't have semicolons after the closing brace
+- Methods go in a separate impl block, not inside the struct
+- &str vs String — take &str as parameter, call .to_string() to store it in the HashMap (ownership)
+- .cloned() on get — map.get() returns a reference, .cloned() gives you an owned copy
+- &mut self needed on put and delete because they modify the map, &self on get because it only reads
+- Unit tests live in the same file as the code in a #[cfg(test)] block — tests/ folder is for integration tests that test multiple modules together
+
+**Still fuzzy on:**
+- Rust ownership in general, getting more comfortable but still catching me out
+
+**Next:**
+- Write-Ahead Log — append every write to disk
