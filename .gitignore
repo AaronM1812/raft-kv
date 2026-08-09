@@ -1,1 +1,3 @@
 /target
+wal.log
+/target # skip if already there
