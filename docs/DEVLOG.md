@@ -76,3 +76,29 @@
 
 **Next:**
 - Crash recovery test — write 100 keys, kill -9 the process, restart, verify all 100 present
+
+## 09/08/2026 — Crash recovery test with kill -9
+
+**What I did:**
+- Built src/bin/crash_test.rs with two modes selected by a command-line argument: `write` and `verify`
+- `write` puts 10,000 deterministic keys (key:i → value:i), then sits in an infinite loop so the process stays alive to be killed
+- `verify` opens the same log in a fresh process, loops 0..10000, and for each key checks whether it's present and whether its value matches — counting hits, tracking whether a key ever appears after a missing one (gap detection), and printing the result
+- Ran the roadmap version (kill after writing completes): 100 of 100 present, gap false
+- Ran the harder version (kill mid-write) five times: 252, 254, 256, 258, 258 of 10,000 — all values correct, gap false every run
+
+**What I learned:**
+- No comparison file needed. My first instinct was to have `write` record what it did to a second file so `verify` could diff against it — but that file has exactly the same durability problem being tested. Two WALs, no way to tell which one lost data. Deterministic keys remove the need entirely: verify recomputes what the value should be
+- The property being tested isn't a count, it's a shape. There's no target number because you don't control where the kill lands. What must hold is that survivors form a contiguous prefix from 0 — a hole would mean something is seriously wrong with append ordering or replay
+- ~510 writes/sec on an M-series MacBook Air, and the variance across five runs was tiny (252–258). That tightness is the signature of a workload bound by a fixed-cost operation — every write waits on one fsync. A memory- or CPU-bound workload would be far noisier. This is the sync_all cost from DESIGN.md showing up in practice, and it's the number group commit would attack
+- `cargo run --bin crash_test -- write` builds and runs in one step; the `--` separates cargo's arguments from the program's
+
+**What broke:**
+- First attempt at the mid-write kill returned 0 every single run. The kill was landing before the process had even started its loop — shell fork, exec and startup lost the race to `kill -9`. Fixed by raising the loop to 10,000 writes and adding `sleep 0.5` before the kill, which lands the kill reliably in the middle
+- Not really a bug in the code, but a good reminder that a test can pass or fail for reasons that have nothing to do with the thing under test
+
+**What this proves:**
+- `verify` starts cleanly on a log whose final entry is very likely torn. Before the read_entry fix this would have panicked and the store would have been permanently unopenable. The Err path returning the partially-rebuilt map is doing exactly what it was written to do, under a real SIGKILL rather than a synthetic test
+- Data that reached the log survives a process death that runs no cleanup code at all — no destructors, no flush, no graceful shutdown
+
+**Next:**
+- TCP server — async Tokio server in server.rs, wire protocol PUT key\nvalue\n, storage wrapped in Arc<RwLock<>>, one task per client
