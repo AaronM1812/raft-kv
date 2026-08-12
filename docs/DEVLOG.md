@@ -44,3 +44,35 @@
 
 **Next:**
 - Write-Ahead Log — append every write to disk
+
+## 09/08/2026 — WAL complete: durability, replay hardening, test isolation
+
+**What I did:**
+- Added src/lib.rs with `pub mod storage;` — storage is now a library both binaries can import from, instead of being locked inside main.rs
+- Made Storage and its four methods `pub` so they're visible outside the module
+- Gave `Storage::new()` a path parameter instead of hardcoding "wal.log" — every test now uses its own log file
+- Added `sync_all()` to put and delete after the appends
+- Extracted the byte-parsing out of `new()` into a standalone `read_entry()` function returning `io::Result<Entry>`
+- Added an `Entry` enum with Put and Delete variants
+- Added `test_replay` — writes keys, drops the Storage, rebuilds from the same log, asserts the data came back
+- All 4 unit tests passing
+
+**What I learned:**
+- Every file in src/bin/ is its own separate crate — it can't see modules declared in main.rs. Shared code has to live in a library (lib.rs)
+- Everything in Rust is private by default; the module boundary needs `pub` even for code in the same package
+- Cargo runs tests concurrently, so three tests sharing one wal.log were deleting and writing over each other. Failures were timing-dependent — a test that never writes anything crashed reading another test's delete entry
+- `write_all` only hands bytes to the OS; the OS flushes to disk whenever it likes. A crash in that window loses a write the client was already told succeeded — which defeats the entire point of a WAL
+- `sync_all` vs `sync_data`: sync_data flushes file contents, sync_all also flushes metadata including file size. Size matters here because replay finds the end of the log by reading until the read fails — if the OS has the data but not the updated size, those bytes are past EOF and unreachable
+- `?` returns the error out of the function instead of panicking like `.unwrap()`. It only works in a function returning Result, which is why the parsing had to move out of `new()` (which returns Storage) before it could be fixed
+- An enum expresses "one of several shapes" — read_entry returns either a Put (key + value) or a Delete (key only), one function, one return type
+
+**What broke:**
+- Replay panicked on a truncated entry. A crash mid-write leaves a partial entry at the end of the log; `.unwrap()` on the short read killed the process, and since the bad bytes stay in the file, the store could never start again — one badly-timed crash bricks the database permanently
+- Fix: read_entry returns an Err on a short read, the loop in `new()` breaks, and the map returns with every complete entry replayed. The incomplete write is discarded, which is correct — it was never acknowledged to a client, so it never happened
+- Same handling covers three cases: clean EOF, truncated entry, and unknown opcode. All mean "stop replaying, keep what's valid"
+
+**Still fuzzy on:**
+- Whether discarding a corrupt-opcode entry silently is right, or whether it should be louder than a truncated tail
+
+**Next:**
+- Crash recovery test — write 100 keys, kill -9 the process, restart, verify all 100 present
