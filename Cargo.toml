@@ -2,5 +2,7 @@
 name = "raft-kv"
 version = "0.1.0"
 edition = "2024"
+default-run = "raft-kv"
 
 [dependencies]
+tokio = { version = "1", features = ["full"] }

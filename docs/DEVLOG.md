@@ -102,3 +102,34 @@
 
 **Next:**
 - TCP server — async Tokio server in server.rs, wire protocol PUT key\nvalue\n, storage wrapped in Arc<RwLock<>>, one task per client
+
+## 13/08/2026 — TCP server: async Tokio server with concurrent clients
+
+**What I did:**
+- Created src/server.rs and added `pub mod server;` to lib.rs — server is library code, not a binary, so tests can call it directly rather than launching a process
+- main.rs now creates the Storage (which replays the WAL), wraps it in `Arc<RwLock<>>`, and passes it to `server::run()`. main does wiring and config; server does logic
+- `run()` binds a TcpListener to 127.0.0.1:7878 and loops on `accept().await` — parks until a client connects instead of busy-waiting
+- Each accepted connection clones the Arc and spawns a task via `tokio::spawn`, passing the socket and storage handle into `process()`
+- `process()` wraps the socket in a BufReader, loops reading lines, splits the first word as the command and the rest as the key, and pattern-matches to dispatch
+- Implemented all five protocol responses: GET hit (`OK <len>\n<bytes>`), GET miss (`NOT_FOUND`), PUT/DELETE success (`OK`), missing key (`ERR missing key`), unknown command (`ERR unknown command`)
+- Full round trip working end to end: PUT a key, GET it back, DELETE it, GET returns NOT_FOUND. Data persists to the WAL and is replayed on restart
+
+**What I learned:**
+- `tokio::spawn` returns immediately; it hands the task to the runtime rather than waiting for it. Calling `process(socket).await` directly instead would serialise clients — one connection served to completion before the next is accepted. The spawn is what makes the server concurrent
+- Cloning an `Arc` doesn't copy the Storage. It increments a reference count, so every task holds a pointer to the same underlying data. The clone has to be inside the accept loop — one handle per connection, moved into that task
+- `RwLock` over `Mutex`: many readers concurrently, or one writer alone. GETs don't block each other. A Mutex would serialise reads for no reason. Using tokio's RwLock rather than std's, because std's blocks the OS thread instead of yielding to the runtime
+- PUT needs two reads. The protocol is `PUT key\nvalue\n`, so the command line only gives the key — the value is a separate `read_line` inside the arm. Read into a fresh String rather than reusing `line`, because the key borrows from `line` and reusing it would upset the borrow checker
+- `read_line` returns the byte count; 0 means the client disconnected. Checked in two places — the main loop, and inside the PUT arm for a client that sends a key then hangs up
+- A task parked on `.await` waiting for client input costs almost nothing. Thread-per-connection would tie up an OS thread per idle client; async tasks are cheap enough that idle connections are effectively free
+
+**What broke:**
+- Saw a phantom `ERR unknown command` in the middle of a working session. Turned out not to be a bug: the GET response is `OK <len>\n` followed by raw bytes with no trailing newline, by design — the length already tells the client how many bytes to read. That leaves the terminal cursor mid-line, so pressing Enter to tidy up sent an empty line, which parsed as an empty command and correctly fell through to the unknown-command arm. Worth knowing the length-prefixed format makes the server awkward to drive by hand with `nc`, even though it's the right format for a real client
+- Nearly hit a lock-scope problem in the GET arm. `storage.read().await` returns a guard, and the read lock is held for as long as that guard lives. Matching directly on `storage.read().await.get(k)` keeps the guard alive for the whole match block — meaning the read lock is held while writing to the client's socket. Reads don't block each other, but they do block writers, so a single slow client would stall every PUT and DELETE on a network operation unrelated to storage. Binding the result to a variable first drops the guard at the end of that statement, before any socket writes. General rule: never hold a lock across an `.await` that might block on I/O. `put` already breaks this by holding the write lock across an fsync — deliberate, documented, and the thing group commit would fix
+- Lost time to brace nesting — three levels of match inside a loop inside a function. The compiler catches it instantly; eyeballing it does not
+
+**Known costs (in DESIGN.md):**
+- `put` and `delete` hold the write lock across an fsync, so every reader and writer is blocked for the duration of a physical disk write (~2ms measured). Concurrent write throughput will be poor and the Phase 4 benchmark will show it. Fixes are group commit, or moving the disk write outside the lock — neither implemented
+- Request framing is still newline-delimited, so a value containing a newline can't be transmitted. Responses are length-prefixed and don't have this problem. Accepted for Phase 1; gRPC replaces the wire protocol in Phase 2
+
+**Next:**
+- Integration test — real TCP client connects, PUTs 10 keys, GETs them back, asserts values match. Plus concurrent clients
