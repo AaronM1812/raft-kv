@@ -133,3 +133,30 @@
 
 **Next:**
 - Integration test — real TCP client connects, PUTs 10 keys, GETs them back, asserts values match. Plus concurrent clients
+
+## 13/08/2026 — Integration tests over real TCP
+
+**What I did:**
+- Created tests/server_test.rs — integration tests, so they live outside src/ and can only touch the public API, exactly as a real consumer would
+- Changed `server::run()` to take an address parameter instead of hardcoding 127.0.0.1:7878, so each test can bind its own port. Same reasoning as giving `Storage::new()` a path parameter earlier
+- `test_put_and_get_over_tcp`: spawns a server in-process, connects a real TcpStream client, then loops 100 times — PUT key:i/value:i, assert `OK`, GET key:i, parse the length from the header, read exactly that many bytes, assert the value matches
+- `test_concurrent_clients`: spawns 5 client tasks against one server, each doing 10 PUT/GET pairs on its own namespaced key range (`c{client_id}:key:{i}`), collects the JoinHandles and awaits all of them
+- Both passing. Five test targets now run under `cargo test`: 4 unit tests in the lib, 2 integration tests, and three targets with none
+
+**What I learned:**
+- The integration test can spawn a server *inside the test process* only because `server::run` is library code. If the server logic lived in main.rs there'd be no way to call it — the test would have to launch a subprocess and coordinate with it. This pays off properly in Phase 2, where three Raft nodes need to run inside one test to watch an election happen
+- `tokio::spawn` returns a JoinHandle. Without collecting them into a Vec and awaiting each one, the test function returns while the clients are still mid-flight and nothing gets asserted — the test would pass vacuously
+- `read_exact`, not `read_line`, for the GET value. The response is `OK <len>\n` followed by raw bytes with no terminator, so the only way to know where the value ends is the length in the header. This is the first time the client half of the protocol design has actually been exercised — and it's the same length-prefix-over-delimiter reasoning as the WAL entry format
+- What the concurrent test actually proves: 5 simultaneous connections don't corrupt each other and no client's data leaks into another's. Namespacing keys by client_id is what makes that meaningful — if the locking were broken you'd see wrong values, not just slow ones
+- What it doesn't prove: any throughput characteristic. Each client is still sequential with itself — PUT, wait for OK, GET, wait for response. No client ever has two requests in flight. It's five sequential streams running alongside each other, not a flood. Real concurrency numbers are the benchmark's job
+
+**What broke:**
+- `response.clear()` was only being called once per loop iteration, before the GET read. `read_line` appends rather than replaces, so iteration two's PUT check saw `"OK 7\nOK\n"` and the assert failed. Needed clearing before *both* reads. Third time this exact trap has bitten — the server's process loop, the unit tests, and now here. `read_line` appending is the single most reliable source of bugs in this codebase so far
+- First version of the loop used `b"PUT key:i\nvalue:i\n"` — byte-string literals don't interpolate, so all 100 iterations wrote the literal key `key:i`. The test would have passed while proving essentially nothing. Fixed with `format!` and `.as_bytes()`. A test that passes for the wrong reason is worse than one that fails
+- Same mistake in the first concurrent version: all 5 clients wrote `key:0` through `key:9`, so they were overwriting each other's keys with identical values. Passing, but testing nothing about isolation
+
+**Open question:**
+- Timing doesn't add up. Both integration tests together did ~150 fsync'd writes in 0.36s — roughly 400/sec, which is in the right range. But the two tests run in parallel and use separate log files, so the disks writes are interleaved across two files. The crash test measured ~510 writes/sec to a single file. Need the baseline benchmark to get a clean number rather than inferring one from test timings
+
+**Next:**
+- Baseline benchmark — 10,000 sequential PUTs, measure ops/sec, then 10,000 concurrent. Record with date and machine spec

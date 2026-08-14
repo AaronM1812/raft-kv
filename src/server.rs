@@ -4,9 +4,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::storage::Storage;
 
-pub async fn run(storage: Arc<RwLock<Storage>>){
+pub async fn run(addr: &str, storage: Arc<RwLock<Storage>>){
     // Bind the listener to the address
-    let listener = TcpListener::bind("127.0.0.1:7878").await.unwrap();
+    let listener = TcpListener::bind(addr).await.unwrap();
 
     loop {
         // The second item contains the IP and port of the new connection.
