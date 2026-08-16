@@ -160,3 +160,39 @@
 
 **Next:**
 - Baseline benchmark — 10,000 sequential PUTs, measure ops/sec, then 10,000 concurrent. Record with date and machine spec
+
+## 13/08/2026 — Phase 1 complete: baseline benchmark
+
+**Numbers (M-series MacBook Air, release build, 13/08/2026):**
+- Sequential: 343 ops/sec (10,000 PUTs, single thread, direct to Storage)
+- Concurrent: 368 ops/sec (10,000 PUTs, 5 tasks × 2,000, through Arc<RwLock<Storage>>)
+- Debug build: 345 and 355 — statistically identical to release
+
+**What the numbers mean:**
+- Concurrency buys nothing. Five writers produce the same throughput as one, because `put` holds the write lock across the fsync. The tasks queue and execute serially, each waiting ~3ms on a physical disk write. Adding clients adds queue depth, not throughput
+- Release ≈ debug is the strongest evidence in the set. Optimisation changes nothing because the CPU is barely doing anything — every write is parked waiting for the disk. A compute-bound workload would show release several times faster. It doesn't, so the system is definitively I/O-bound
+- The RwLock isn't failing; it's doing exactly what it was asked to. But holding it across the fsync is what caps the system. The lock is the mechanism, the fsync is the cost
+- Cross-checks against earlier measurements: the crash test measured ~510 writes/sec, the integration tests ~400/sec inferred from timings. Same order of magnitude, different conditions — the crash test wrote smaller keys with no `format!` allocations and no lock. The benchmark number is the one to quote because it's the only clean measurement
+
+**What I'd do differently:**
+- Nothing structural. The one experiment worth running is group commit — batching multiple writes behind a single fsync. That's the only change that would move the concurrent number materially, and it's the obvious next step if throughput ever becomes the constraint
+- Related: moving the disk write outside the lock would let readers proceed during a write, though it wouldn't help write throughput on its own
+
+**What surprised me:**
+- That concurrency made no difference at all. I expected some gain from five clients and got noise. Tracing why led to the clearest understanding of the whole phase: async concurrency helps when tasks are waiting on independent things, and does nothing when they're all queued behind one synchronous operation. The server can hold thousands of idle connections cheaply — but that's a connection-scaling property, not a throughput one
+
+**What Phase 1 delivered:**
+- A single-node persistent key-value store: `HashMap<String, Vec<u8>>` fronted by a Bitcask-style append-only WAL, fsync'd on every write, replayed on startup
+- Crash recovery proven under real SIGKILL — data survives a process death that runs no cleanup code, and a truncated final entry is discarded cleanly rather than bricking the store
+- An async Tokio TCP server with one task per client, a length-prefixed wire protocol, and storage shared via `Arc<RwLock<>>`
+- 6 automated tests: 4 unit, 2 integration (one sequential, one with 5 concurrent clients), plus a manual crash-test binary
+- Documented decisions in DESIGN.md with tradeoffs, and known limitations recorded as choices rather than oversights
+
+**What I'm taking into Phase 2:**
+- A storage layer I trust. The whole point of building it first was that a WAL replay bug in Phase 2 would look like a Raft bug. Storage is now proven independently, so when the chaos tests fail I can be confident the problem is in consensus
+- The server as library code, not a binary. Phase 2 needs three nodes running inside one test process to observe an election — only possible because `server::run` is callable
+- The fsync cost as a known quantity. Raft adds a second fsync per write (the leader persists the log entry before replicating), so ~345 ops/sec is the ceiling I'm starting from and it will get worse before it gets better
+- Lock discipline: never hold a lock across an `.await` that might block on I/O. Phase 1 already breaks this deliberately in one place; Raft has far more opportunities to break it accidentally
+
+**Next:**
+- Phase 2 — Raft consensus. Read the paper properly with notes, write PHASE2.md defining every RPC and state transition, then gRPC transport before any Raft logic
