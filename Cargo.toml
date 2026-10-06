@@ -6,3 +6,15 @@ default-run = "raft-kv"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+# gRPC runtime: connections, HTTP/2, request/response matching
+tonic = "0.14.6"
+# protobuf encode/decode for the generated structs
+prost = "0.14.4"
+# glue so tonic can use prost as its codec
+tonic-prost = "0.14.6"
+
+[build-dependencies]
+# codegen: raft.proto -> Rust structs + Raft trait + RaftClient
+tonic-prost-build = "0.14.6"
+# bundled protoc binary so the build doesn't depend on a system install
+protoc-bin-vendored = "3.2.0"
