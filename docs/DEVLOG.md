@@ -196,3 +196,28 @@
 
 **Next:**
 - Phase 2 — Raft consensus. Read the paper properly with notes, write PHASE2.md defining every RPC and state transition, then gRPC transport before any Raft logic
+## 06/10/2026 — Phase 2 start: PHASE2.md + gRPC transport
+
+**What I did:**
+- Wrote PHASE2.md before any code: the `RaftNode` struct (persistent / volatile / leader-only fields), the `Command` enum, the RequestVote RPC and its receiver rules, the Follower → Candidate → Leader state machine, and the timeout choices. AppendEntries is deferred until Replication
+- Defined `proto/raft.proto`: four messages (RequestVote and AppendEntries, each with a request and a response) and a `Raft` service with both RPCs. Each RPC states what it takes in and what it returns
+- Added `build.rs`, which runs before `cargo build` compiles `src/`. It uses tonic to turn `raft.proto` into Rust: the message structs, a `Raft` trait for the server and a `RaftClient`. It uses a bundled protoc binary so the build doesn't depend on a system install
+- Implemented both RPCs as stubs on `Node` in `src/node.rs`: each logs the request and replies with success
+- Added the `src/bin/raft_node.rs` demo: `raft_node <id>` runs a gRPC server on port 5000+id, waits 3s for the others to start, then sends a RequestVote to each peer. With 3 nodes running, every node sends and receives votes
+
+**What I learned:**
+- The `.proto` file is the contract between nodes. Messages define the data and the service defines the calls. Tonic generates the code for both sides from it, so the client and server can't drift apart
+- The generated `Raft` trait is the server side. Implementing it on `Node` is all it takes to make a node answerable. `RaftClient` is the calling side
+- `req.into_inner()` unwraps the gRPC envelope to get the plain request struct
+- Every node is both a server and a client: it receives RPCs from peers and sends them its own
+
+**What broke:**
+- Nothing this session
+
+**Known gaps:**
+- The handlers are stubs. They grant every vote and accept every AppendEntries, with no term checks and no state
+- `AppendEntriesRequest` only carries `term` and `leader_id`. Log fields come with Replication
+- The 3s startup sleep is a demo hack. Real nodes have to handle peers that aren't up yet
+
+**Next:**
+- Election: grow `Node` into the full `RaftNode`, persist term and vote, then add randomised election timeouts and heartbeats
