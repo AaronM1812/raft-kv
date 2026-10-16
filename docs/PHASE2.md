@@ -4,8 +4,11 @@
 - Name: `RaftNode`
 - Lives in: `src/node.rs`
 - One per process. Every node runs both a gRPC server (receives RPCs) and holds a gRPC client per peer (sends RPCs).
+- State lives behind one `Arc<Mutex<>>` — the RPC handlers and the election timer all mutate it. Mutex over RwLock: nearly every access writes.
 
 ### Persistent — fsync'd before replying to any RPC
+`current_term` + `voted_for` → own small file, overwritten on change. `log` → own append-only file. Phase 1 WAL untouched.
+
 - `current_term: u64` — logical clock; increments on every election attempt, never decreases
 - `voted_for: Option<u64>` — who I voted for in `current_term`; `None` if not yet voted; reset to `None` on term change
 - `log: Vec<LogEntry>` — `LogEntry { term: u64, command: Command }`; index 0 is a dummy entry so indices match the paper (1-based)

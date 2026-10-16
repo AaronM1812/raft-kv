@@ -67,3 +67,15 @@ Three conditions produce an `Err` and are handled identically: clean EOF, trunca
 **Cost:** memory scales with total data volume rather than key count, so the store cannot hold a dataset larger than RAM. Bitcask's approach scales to datasets far exceeding memory. For a project whose working set is a benchmark of ~10,000 keys, this is not a binding constraint — but the roadmap describes this as "Bitcask-style" and the difference is worth stating plainly rather than being caught by it.
 
 **Also not implemented:** log compaction. The log grows without bound; repeated puts to the same key accumulate dead entries, and deletes never reclaim space. Bitcask merges old log files into compacted ones in the background. Startup time grows linearly with total writes ever made, not with live key count.
+
+## Phase 2 — Raft consensus
+
+### Persistence: term/vote file, Raft log, and Storage WAL kept separate
+
+**Chose:** a tiny `raft_state` file (`current_term`, `voted_for`) overwritten and fsync'd on every change; a separate append-only Raft log; the Phase 1 WAL unchanged, written only when committed entries are applied.
+
+**Considered:** one merged log, where the Raft log *is* the WAL (as in etcd).
+
+**Why:** term and vote are two values that get replaced, not a growing list, and a node can vote without any entry being written. If the vote isn't saved, a restarted node can vote twice in one term, which allows two leaders. Keeping the Raft log separate leaves the proven storage layer untouched.
+
+**Cost:** two fsyncs per write (Raft log + WAL). Merging is the known Phase 4 optimisation.
