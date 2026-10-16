@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- server half: spawn so it runs in the background ---
     tokio::spawn(async move {
         Server::builder()
-            .add_service(RaftServer::new(Node { id }))
+            .add_service(RaftServer::new(Node::new(id)))
             .serve(addr)
             .await
             .unwrap();

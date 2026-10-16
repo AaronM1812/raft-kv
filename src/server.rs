@@ -1,10 +1,10 @@
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use crate::storage::Storage;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
 
-pub async fn run(addr: &str, storage: Arc<RwLock<Storage>>){
+pub async fn run(addr: &str, storage: Arc<RwLock<Storage>>) {
     // Bind the listener to the address
     let listener = TcpListener::bind(addr).await.unwrap();
 
@@ -24,7 +24,9 @@ async fn process(socket: TcpStream, storage: Arc<RwLock<Storage>>) {
     let mut line = String::new();
     loop {
         let n = reader.read_line(&mut line).await.unwrap();
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         let trimmed = line.trim_end();
         let mut parts = trimmed.splitn(2, ' ');
         let command = parts.next().unwrap();
@@ -33,49 +35,55 @@ async fn process(socket: TcpStream, storage: Arc<RwLock<Storage>>) {
         //split first word
         //match on it
         match command {
-            "GET" => {match key {
+            "GET" => match key {
                 Some(k) => {
                     let result = storage.read().await.get(k);
                     match result {
                         Some(v) => {
-                                    let header = format!("OK {}\n", v.len());
-                                    reader.write_all(header.as_bytes()).await.unwrap();
-                                    reader.write_all(&v).await.unwrap();
+                            let header = format!("OK {}\n", v.len());
+                            reader.write_all(header.as_bytes()).await.unwrap();
+                            reader.write_all(&v).await.unwrap();
                         }
-                        None => {reader.write_all(b"NOT_FOUND\n").await.unwrap();}
+                        None => {
+                            reader.write_all(b"NOT_FOUND\n").await.unwrap();
+                        }
                     }
                 }
 
-                None => { reader.write_all(b"ERR missing key\n").await.unwrap();}
-            }
-            }
-            "DELETE" => {match key {
+                None => {
+                    reader.write_all(b"ERR missing key\n").await.unwrap();
+                }
+            },
+            "DELETE" => match key {
                 Some(k) => {
                     storage.write().await.delete(k);
                     reader.write_all(b"OK\n").await.unwrap();
                 }
-                None => { reader.write_all(b"ERR missing key\n").await.unwrap(); }
+                None => {
+                    reader.write_all(b"ERR missing key\n").await.unwrap();
                 }
-            }
+            },
 
-            "PUT" => {
-                match key {
-                    Some(k) => {
-                        let mut value_line = String::new();
-                        let n = reader.read_line(&mut value_line).await.unwrap();
-                        if n == 0 { break; }
-                        let value = value_line.trim_end();
-                        storage.write().await.put(k, value.as_bytes().to_vec());
-                        reader.write_all(b"OK\n").await.unwrap();
+            "PUT" => match key {
+                Some(k) => {
+                    let mut value_line = String::new();
+                    let n = reader.read_line(&mut value_line).await.unwrap();
+                    if n == 0 {
+                        break;
                     }
-                    None => { reader.write_all(b"ERR missing key\n").await.unwrap(); }
+                    let value = value_line.trim_end();
+                    storage.write().await.put(k, value.as_bytes().to_vec());
+                    reader.write_all(b"OK\n").await.unwrap();
                 }
-            }
+                None => {
+                    reader.write_all(b"ERR missing key\n").await.unwrap();
+                }
+            },
 
-            _ => { reader.write_all(b"ERR unknown command\n").await.unwrap(); }
+            _ => {
+                reader.write_all(b"ERR unknown command\n").await.unwrap();
+            }
         }
         line.clear();
     }
 }
-
-

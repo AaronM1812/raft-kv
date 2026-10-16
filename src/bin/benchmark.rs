@@ -27,7 +27,10 @@ async fn main() {
         let storage = storage.clone();
         let handle = tokio::spawn(async move {
             for i in 0..2000 {
-                storage.write().await.put(&format!("c{}:key:{}", client_id, i), format!("value:{}", i).into_bytes());
+                storage.write().await.put(
+                    &format!("c{}:key:{}", client_id, i),
+                    format!("value:{}", i).into_bytes(),
+                );
             }
         });
         handles.push(handle);

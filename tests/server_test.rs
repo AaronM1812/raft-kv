@@ -4,11 +4,11 @@
 //and then connect our client
 //and run some tests
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use raft_kv::storage::Storage;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::sync::RwLock;
 
 #[tokio::test]
 async fn test_put_and_get_over_tcp() {
@@ -26,21 +26,27 @@ async fn test_put_and_get_over_tcp() {
     let mut reader = BufReader::new(stream);
     let mut response = String::new();
 
-    for i in 0..100{
+    for i in 0..100 {
         response.clear();
         let cmd = format!("PUT key:{}\nvalue:{}\n", i, i);
         reader.write_all(cmd.as_bytes()).await.unwrap();
 
         reader.read_line(&mut response).await.unwrap();
         assert_eq!(response, "OK\n");
-        
+
         let cmd = format!("GET key:{}\n", i);
         reader.write_all(cmd.as_bytes()).await.unwrap();
 
         response.clear();
         reader.read_line(&mut response).await.unwrap();
 
-        let len: usize = response.trim_end().splitn(2, ' ').nth(1).unwrap().parse().unwrap();
+        let len: usize = response
+            .trim_end()
+            .splitn(2, ' ')
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
 
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf).await.unwrap();
@@ -51,7 +57,7 @@ async fn test_put_and_get_over_tcp() {
 }
 
 #[tokio::test]
-async fn test_concurrent_clients(){
+async fn test_concurrent_clients() {
     let _ = std::fs::remove_file("test_tcp_concurrent.log");
     let storage = Arc::new(RwLock::new(Storage::new("test_tcp_concurrent.log")));
 
@@ -76,14 +82,20 @@ async fn test_concurrent_clients(){
 
                 reader.read_line(&mut response).await.unwrap();
                 assert_eq!(response, "OK\n");
-                
+
                 let cmd = format!("GET c{}:key:{}\n", client_id, i);
                 reader.write_all(cmd.as_bytes()).await.unwrap();
 
                 response.clear();
                 reader.read_line(&mut response).await.unwrap();
 
-                let len: usize = response.trim_end().splitn(2, ' ').nth(1).unwrap().parse().unwrap();
+                let len: usize = response
+                    .trim_end()
+                    .splitn(2, ' ')
+                    .nth(1)
+                    .unwrap()
+                    .parse()
+                    .unwrap();
 
                 let mut buf = vec![0u8; len];
                 reader.read_exact(&mut buf).await.unwrap();
@@ -98,5 +110,4 @@ async fn test_concurrent_clients(){
     for handle in handles {
         handle.await.unwrap();
     }
-
 }

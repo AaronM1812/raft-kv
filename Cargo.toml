@@ -12,6 +12,8 @@ tonic = "0.14.6"
 prost = "0.14.4"
 # glue so tonic can use prost as its codec
 tonic-prost = "0.14.6"
+# random election timeouts
+rand = "0.9"
 
 [build-dependencies]
 # codegen: raft.proto -> Rust structs + Raft trait + RaftClient

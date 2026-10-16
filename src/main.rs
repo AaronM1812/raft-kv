@@ -1,6 +1,6 @@
+use raft_kv::storage::Storage;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use raft_kv::storage::Storage;
 
 #[tokio::main]
 async fn main() {
