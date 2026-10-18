@@ -251,6 +251,7 @@ impl Raft for Node {
             state.voted_for = Some(req.candidate_id);
             save_state(self.id, state.current_term, state.voted_for)
                 .map_err(|e| Status::internal(e.to_string()))?;
+            state.last_heartbeat = Instant::now(); // granted a vote: give that candidate time to win
         }
 
         println!(
