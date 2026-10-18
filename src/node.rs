@@ -1,3 +1,4 @@
+use crate::raft::raft_client::RaftClient;
 use crate::raft::raft_server::Raft;
 use crate::raft::{
     AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
@@ -7,12 +8,14 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::task::JoinSet;
+use tokio::time::{sleep, timeout};
 use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
 pub struct Node {
     pub id: u64,
+    peers: Vec<u64>,
     state: Arc<Mutex<State>>,
 }
 
@@ -57,6 +60,7 @@ impl Node {
         };
         Node {
             id,
+            peers: (1..=3).filter(|&p| p != id).collect(), // 3-node cluster for now
             state: Arc::new(Mutex::new(state)),
         }
     }
@@ -77,7 +81,110 @@ impl Node {
     }
 
     async fn start_election(&self) {
-        todo!() // you write this next
+        // 1. become a candidate, under the lock
+        let (election_term, last_log_index, last_log_term) = {
+            let mut state = self.state.lock().await;
+            state.role = Role::Candidate;
+            state.current_term += 1;
+            state.voted_for = Some(self.id);
+
+            // persist before asking anyone, or a restart could
+            // vote twice this term
+            if let Err(e) = save_state(self.id, state.current_term, state.voted_for) {
+                eprintln!("node {} failed to save state: {e}", self.id);
+                return;
+            }
+
+            state.last_heartbeat = Instant::now(); // restart own timer
+
+            println!(
+                "node {} starting election for term {}",
+                self.id, state.current_term
+            );
+
+            (
+                state.current_term, // snapshot: compared against each reply later
+                state.log.len() as u64,
+                state.log.last().map_or(0, |e| e.term),
+            )
+        }; // lock released: never hold it across network calls
+
+        // 2. ask every peer at once, one task each, so a dead
+        // peer only stalls its own task
+        let mut tasks = JoinSet::new();
+
+        for &peer in &self.peers {
+            let req = RequestVoteRequest {
+                term: election_term,
+                candidate_id: self.id,
+                last_log_index,
+                last_log_term,
+            };
+
+            tasks.spawn(async move {
+                let call = async move {
+                    let addr = format!("http://127.0.0.1:{}", 5000 + peer);
+                    let mut client = RaftClient::connect(addr).await.ok()?;
+
+                    Some(client.request_vote(req).await.ok()?.into_inner())
+                };
+
+                // no reply within 100 ms counts as no vote
+                timeout(Duration::from_millis(100), call)
+                    .await
+                    .ok()
+                    .flatten()
+            });
+        }
+
+        // 3. count replies as they arrive
+        let majority = (self.peers.len() + 1) / 2 + 1; // whole cluster incl. me: 3 nodes -> 2
+        let mut votes = 1; // my own vote
+
+        while let Some(result) = tasks.join_next().await {
+            let Ok(Some(resp)) = result else {
+                continue;
+            }; // dead/slow peer: no vote
+
+            let mut state = self.state.lock().await;
+
+            // someone is in a newer term: step down
+            if resp.term > state.current_term {
+                state.current_term = resp.term;
+                state.voted_for = None;
+                state.role = Role::Follower;
+
+                if let Err(e) = save_state(self.id, state.current_term, state.voted_for) {
+                    eprintln!("node {} failed to save state: {e}", self.id);
+                }
+
+                return;
+            }
+
+            // stale: a heartbeat made me Follower, or a newer
+            // election started
+            if state.role != Role::Candidate || state.current_term != election_term {
+                return;
+            }
+
+            if resp.vote_granted {
+                votes += 1;
+
+                if votes >= majority {
+                    state.role = Role::Leader;
+
+                    println!(
+                        "node {} became leader for term {election_term} ({votes} votes)",
+                        self.id
+                    );
+
+                    return; // dropping the JoinSet cancels any replies still pending
+                }
+            }
+
+            // no majority yet: the timer loop starts the next
+            // election
+        }
     }
 }
 
