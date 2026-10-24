@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout};
+use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
@@ -150,11 +150,7 @@ impl Node {
 
             // someone is in a newer term: step down
             if resp.term > state.current_term {
-                state.current_term = resp.term;
-                state.voted_for = None;
-                state.role = Role::Follower;
-
-                if let Err(e) = save_state(self.id, state.current_term, state.voted_for) {
+                if let Err(e) = self.step_down(&mut state, resp.term) {
                     eprintln!("node {} failed to save state: {e}", self.id);
                 }
 
@@ -178,6 +174,9 @@ impl Node {
                         self.id
                     );
 
+                    // heartbeat straight away so the other nodes stop electing
+                    tokio::spawn(self.clone().run_heartbeats(election_term));
+
                     return; // dropping the JoinSet cancels any replies still pending
                 }
             }
@@ -185,6 +184,68 @@ impl Node {
             // no majority yet: the timer loop starts the next
             // election
         }
+    }
+
+    async fn run_heartbeats(self, leader_term: u64) {
+        // interval, not sleep: keeps a steady 50ms beat, and the first
+        // tick fires immediately
+        let mut ticker = interval(Duration::from_millis(50));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+
+            {
+                let state = self.state.lock().await;
+                // term check too: if I step down and win a later term, this
+                // old loop must not keep running beside the new one
+                if state.role != Role::Leader || state.current_term != leader_term {
+                    println!("node {} stopped heartbeats for term {leader_term}", self.id);
+                    return;
+                }
+            } // lock released: never hold it across network calls
+
+            // one task per peer, never awaited, so a dead peer can't
+            // delay the next tick
+            for &peer in &self.peers {
+                let node = self.clone();
+
+                tokio::spawn(async move {
+                    let req = AppendEntriesRequest {
+                        term: leader_term,
+                        leader_id: node.id,
+                    };
+                    let call = async move {
+                        let addr = format!("http://127.0.0.1:{}", 5000 + peer);
+                        let mut client = RaftClient::connect(addr).await.ok()?;
+
+                        Some(client.append_entries(req).await.ok()?.into_inner())
+                    };
+
+                    // dead/slow peer: nothing to do, the next tick retries
+                    let Ok(Some(resp)) = timeout(Duration::from_millis(100), call).await else {
+                        return;
+                    };
+
+                    // someone is in a newer term: step down; the loop sees
+                    // it on its next tick and exits
+                    let mut state = node.state.lock().await;
+                    if resp.term > state.current_term {
+                        if let Err(e) = node.step_down(&mut state, resp.term) {
+                            eprintln!("node {} failed to save state: {e}", node.id);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    // newer term seen: adopt it, clear my vote, become Follower (universal rule)
+    fn step_down(&self, state: &mut State, term: u64) -> io::Result<()> {
+        state.current_term = term;
+        state.voted_for = None;
+        state.role = Role::Follower;
+        save_state(self.id, state.current_term, state.voted_for)
     }
 }
 
@@ -225,10 +286,7 @@ impl Raft for Node {
 
         // 0. newer term seen: adopt it and step down (universal rule)
         if req.term > state.current_term {
-            state.current_term = req.term;
-            state.voted_for = None;
-            state.role = Role::Follower;
-            save_state(self.id, state.current_term, state.voted_for)
+            self.step_down(&mut state, req.term)
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
 
@@ -268,13 +326,37 @@ impl Raft for Node {
         &self,
         req: Request<AppendEntriesRequest>,
     ) -> Result<Response<AppendEntriesResponse>, Status> {
-        let req = req.into_inner(); // unwrap th gRPC envelope to get your struct
-        println!(
-            "node {} got AppendEntries from {} term {}",
-            self.id, req.leader_id, req.term
-        );
+        let req = req.into_inner(); // unwrap the gRPC envelope to get your struct
+        let mut state = self.state.lock().await;
+
+        // 0. newer term seen: adopt it and step down (universal rule)
+        if req.term > state.current_term {
+            self.step_down(&mut state, req.term)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+
+        // 1. stale leader: reject; my term in the reply makes it step down
+        if req.term < state.current_term {
+            return Ok(Response::new(AppendEntriesResponse {
+                term: state.current_term,
+                success: false,
+            }));
+        }
+
+        // 2. valid leader for my term. One leader per term, so if I'm a
+        // Candidate I lost this election
+        if state.role == Role::Candidate {
+            println!(
+                "node {} found leader {} for term {}, back to Follower",
+                self.id, req.leader_id, req.term
+            );
+            state.role = Role::Follower;
+        }
+
+        state.last_heartbeat = Instant::now(); // leader is alive: hold off elections
+
         Ok(Response::new(AppendEntriesResponse {
-            term: req.term,
+            term: state.current_term,
             success: true,
         }))
     }
