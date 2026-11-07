@@ -79,3 +79,17 @@ Three conditions produce an `Err` and are handled identically: clean EOF, trunca
 **Why:** term and vote are two values that get replaced, not a growing list, and a node can vote without any entry being written. If the vote isn't saved, a restarted node can vote twice in one term, which allows two leaders. Keeping the Raft log separate leaves the proven storage layer untouched.
 
 **Cost:** two fsyncs per write (Raft log + WAL). Merging is the known Phase 4 optimisation.
+
+### Timeouts: random 150–300ms election timeout, counted from the last heartbeat; 50ms heartbeats
+
+**Chose:** each follower picks a random election timeout between 150 and 300ms and starts an election if that long has passed since its last heartbeat (or since it granted a vote). The leader sends a heartbeat every 50ms.
+
+**Considered:** counting the timeout from when the timer started sleeping. That was the first version, and the failover test showed it can take nearly two timeouts (448ms worst run) to notice a dead leader.
+
+**Why:**
+- The heartbeat is much shorter than the shortest timeout, so a few lost or slow heartbeats don't trigger an election while the leader is alive
+- Randomising the timeout means one follower usually times out well before the other and wins before the second one starts, so split votes are rare
+- Counting from the last heartbeat bounds failover: a new leader within one timeout plus a vote round trip, under 350ms in the failover test
+- 150–300ms is the range the Raft paper uses, and it's far above the round trip on localhost
+
+**Cost:** split votes still happen, on about 10% of kills in the failover test. Each one adds up to another 300ms timeout before a leader is elected.

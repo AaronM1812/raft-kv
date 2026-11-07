@@ -221,3 +221,77 @@
 
 **Next:**
 - Election: grow `Node` into the full `RaftNode`, persist term and vote, then add randomised election timeouts and heartbeats
+
+## 16/10/2026 — RaftNode state, persisted term/vote, RequestVote rules
+
+**What I did:**
+- Wrote the persistence decision into DESIGN.md before coding: a small `raft_state` file for term and vote, a separate Raft log, and the Phase 1 WAL left unchanged
+- Grew `Node` into the full Raft state behind one `Mutex`: `current_term`, `voted_for`, `log`, `role`, `commit_index`, `last_applied`, `last_heartbeat`, plus the `LogEntry`, `Role` and `Command` types
+- `save_state` writes term and vote to `raft_state_N.tmp`, fsyncs, then renames it over `raft_state_N`. `load_state` reads it on startup, and a missing file means first boot (term 0, no vote)
+- Replaced the stub `request_vote` with the real rules: adopt a newer term, reject a stale candidate, reject if I already voted for someone else this term, reject if the candidate's log is behind mine, and save the vote before replying
+- Added `step_down` for the universal rule: on a newer term, adopt it, clear my vote and become Follower
+- Added `rand` for election timeouts, and ran rustfmt over the Phase 1 code
+
+**What I learned:**
+- The vote has to be on disk before the reply goes out. If a node votes, crashes and forgets, it can vote again in the same term, and two candidates can both get a majority
+- Write to a temp file and rename instead of overwriting in place. The rename swaps the file in one step, so a crash leaves either the old state or the new state, never half of each
+
+**Next:**
+- Elections: the election timer and `start_election`
+
+## 18/10/2026 — Real elections: timer + start_election
+
+**What I did:**
+- `start_election`: become Candidate, increment the term, vote for myself and save it, then send RequestVote to both peers in parallel with a `JoinSet`. A peer that doesn't reply within 100ms counts as no vote
+- Count replies as they arrive. A majority (2 of 3) makes me Leader. A reply with a newer term makes me step down. If I'm no longer a Candidate in that term, the election is stale and I stop counting
+- `run_election_timer`: sleep a random 150–300ms, skip if I'm Leader, otherwise start an election if there's been no heartbeat within the timeout
+- `raft_node` now runs the timer, so real elections replace the dummy vote demo
+- Reset the election timer when I grant a vote, so I give that candidate time to win instead of starting a competing election
+
+**What I learned:**
+- Never hold the state lock across a network call. `start_election` takes what it needs under the lock, releases it, sends the RPCs, and only locks again to count each reply
+- Dropping a `JoinSet` cancels the tasks still running in it, so once I have a majority the remaining requests are simply abandoned
+
+**Known gaps:**
+- No heartbeats yet, so a leader can't stop the others from starting new elections
+
+**Next:**
+- Leader heartbeats and a real AppendEntries handler
+
+## 24/10/2026 — Heartbeats: elections settle on one leader
+
+**What I did:**
+- `run_heartbeats`: spawned as soon as a node wins. It sends an empty AppendEntries to every peer every 50ms using `interval`, and exits once I'm no longer Leader for that term
+- Replaced the stub `append_entries` with the real rules: adopt a newer term, reject a stale leader (my term in the reply makes it step down), turn a Candidate back into a Follower, and reset the election timer
+- With heartbeats running, a 3-node cluster elects one leader and stays on it
+
+**What I learned:**
+- `interval` keeps a steady 50ms beat, where `sleep` in a loop would drift by however long each round of RPCs took
+- There's only one leader per term, so a Candidate that gets a valid AppendEntries for its own term has lost the election and should go back to Follower
+
+**Next:**
+- Failover test: kill the leader and time the new election
+
+## 07/11/2026 — Failover test + election timer bug
+
+**What I did:**
+- Added `tests/failover_test.rs`: start a real 3-node cluster as subprocesses, SIGKILL the leader, time how long until a new leader is elected, restart the dead node, and repeat 10 times
+- Gave `raft_node` an optional `base_port` so the test runs its cluster on 6001–6003, away from the demo's 5001–5003. Each test run uses its own temp directory for state files
+- Fixed the election timer to count from the last heartbeat (below)
+- The test now allows 350ms per failover plus 300ms for each split vote
+
+**What I learned:**
+- A split vote shows up as a skipped term. Terms go up by one per election, so if the old leader was in term 5 and the new one won term 7, nobody won term 6
+- Split votes are expected in Raft. Random timeouts make them rare, not impossible, so a test that never allows them will be flaky
+
+**What broke:**
+- The first test run failed: the worst failover was 448ms against a 350ms limit. The timer slept a fresh random timeout from "now", then checked for a recent heartbeat. If the leader died just before a follower woke, the follower saw the last heartbeat, went back to sleep for up to another 300ms, and only noticed on the next wake. Detecting a dead leader could take nearly two timeouts
+- Fix: sleep until `last_heartbeat + timeout` instead. A dead leader is now noticed within one timeout of its last heartbeat. A leader skips this, because its own `last_heartbeat` stops updating and `sleep_until` would return immediately and spin
+- After the fix, normal failovers were all under 350ms, but split votes happened on about 10% of kills and failed the test. I first allowed 650ms for a split-vote run, which then failed on a double split vote (term 9 to 12, 703ms). The final rule allows 350ms plus 300ms per skipped term
+- Result: 5/5 test runs pass (50 kills). Normal failovers were under 350ms, and the 5 split votes took 334–468ms
+
+**Known gaps:**
+- Split votes on about 10% of kills seems high. My guess, not yet checked, is that `RaftClient::connect` on every RPC slows RequestVote down, which gives the second survivor time to start its own election. Reusing connections should help, and replication will need it anyway
+
+**Next:**
+- DESIGN entry for the timeout choice, then Replication: read §5.3 and write the AppendEntries section of PHASE2.md before coding
