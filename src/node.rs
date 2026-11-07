@@ -9,13 +9,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
+use tokio::time::{interval, sleep, sleep_until, timeout, MissedTickBehavior};
 use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
 pub struct Node {
     pub id: u64,
     peers: Vec<u64>,
+    base_port: u64, // node N listens on base_port + N
     state: Arc<Mutex<State>>,
 }
 
@@ -47,7 +48,7 @@ pub enum Command {
 }
 
 impl Node {
-    pub fn new(id: u64) -> Self {
+    pub fn new(id: u64, base_port: u64) -> Self {
         let (current_term, voted_for) = load_state(id).expect("failed to read raft_state");
         let state = State {
             current_term,
@@ -61,6 +62,7 @@ impl Node {
         Node {
             id,
             peers: (1..=3).filter(|&p| p != id).collect(), // 3-node cluster for now
+            base_port,
             state: Arc::new(Mutex::new(state)),
         }
     }
@@ -68,7 +70,19 @@ impl Node {
     pub async fn run_election_timer(self) {
         loop {
             let timeout = Duration::from_millis(rand::random_range(150..=300));
-            sleep(timeout).await;
+            // read the state before sleeping; the lock drops at the closing brace
+            let (is_leader, last_heartbeat) = {
+                let state = self.state.lock().await;
+                (state.role == Role::Leader, state.last_heartbeat)
+            };
+            if is_leader {
+                // a leader's last_heartbeat goes stale, so sleep_until would spin
+                sleep(timeout).await;
+                continue;
+            }
+            // count the timeout from the last heartbeat, not from now, so a
+            // dead leader is noticed within one timeout instead of nearly two
+            sleep_until((last_heartbeat + timeout).into()).await;
             let state = self.state.lock().await;
             if state.role == Role::Leader {
                 continue; // leader: ignore, go back to sleep
@@ -120,10 +134,11 @@ impl Node {
                 last_log_index,
                 last_log_term,
             };
+            let port = self.base_port + peer;
 
             tasks.spawn(async move {
                 let call = async move {
-                    let addr = format!("http://127.0.0.1:{}", 5000 + peer);
+                    let addr = format!("http://127.0.0.1:{port}");
                     let mut client = RaftClient::connect(addr).await.ok()?;
 
                     Some(client.request_vote(req).await.ok()?.into_inner())
@@ -216,7 +231,7 @@ impl Node {
                         leader_id: node.id,
                     };
                     let call = async move {
-                        let addr = format!("http://127.0.0.1:{}", 5000 + peer);
+                        let addr = format!("http://127.0.0.1:{}", node.base_port + peer);
                         let mut client = RaftClient::connect(addr).await.ok()?;
 
                         Some(client.append_entries(req).await.ok()?.into_inner())
