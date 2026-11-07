@@ -108,8 +108,89 @@ Fixed timeouts → all followers time out together → all become candidates in 
 Paper's recommendation. Must be ≫ network round-trip (~1ms locally) so a vote can complete before others time out, and ≪ MTBF so downtime after a leader crash is short. Revisit in Phase 4 benchmarks if leader failover is slower than expected.
 
 ## AppendEntries RPC
-*Deferred until the Replication step. For Election, an empty AppendEntries with `term` + `leader_id` is sufficient as a heartbeat. Read §5.3 and fill this section in before touching replication.*
+Sent by the leader to every follower, to replicate log entries. With `entries` empty it is the heartbeat, but it still runs the consistency check and carries `leader_commit`, so heartbeats and replication are the same code.
+
+### Request
+- `term: u64` — leader's `current_term`
+- `leader_id: u64`
+- `prev_log_index: u64` — index of the entry just before the new ones
+- `prev_log_term: u64` — term of that entry
+- `entries: Vec<LogEntry>` — new entries to store (empty for a heartbeat)
+- `leader_commit: u64` — leader's `commit_index`, so followers learn what is committed
+
+`next_index` and `match_index` are **not** sent. They're leader-only state, one per follower: `next_index` is the next entry to send that follower, `match_index` the highest entry known to be on it and matching the leader's log.
+
+### Response
+- `term: u64` — receiver's `current_term`
+- `success: bool` — `true` if the follower matched `prev_log_index`/`prev_log_term` and stored the entries
+
+`success: false` has two causes, and `term` tells them apart:
+- reply `term` > leader's term → the leader is stale: step down (universal rule), don't retry
+- otherwise → the `prev` entry didn't match: decrement `next_index` and retry from one entry further back
+
+### Why `prev_log_index` / `prev_log_term`
+Log Matching Property: if two logs have an entry with the same index and term, that entry holds the same command and every entry before it is identical. The follower only accepts new entries if it has the `prev` entry, so each accepted batch extends a log that already matches the leader's up to that point. That's why sending the new entries alone isn't enough: the follower would have no way to know its log matches the leader's before them.
+
+### Receiver rules, in order
+0. If `req.term > current_term`: set `current_term = req.term`, `voted_for = None`, `role = Follower`, fsync. *(Universal rule.)*
+1. `req.term < current_term` → `false` *(stale leader; my term in the reply makes it step down)*
+2. Valid leader for my term: if Candidate, back to Follower; reset the election timer. *(Already done for heartbeats.)*
+3. No entry at `prev_log_index` with term `prev_log_term` → `false`. Covers both cases: my log is too short, or the entry there has a different term. *(`prev_log_index = 0` always matches: the empty start of the log.)*
+4. For each new entry: if I already have an entry at that index with a **different** term, delete it and everything after it.
+5. Append any new entries I don't already have.
+6. fsync the log.
+7. If `leader_commit > commit_index`: `commit_index = min(leader_commit, index of last new entry)`.
+8. → `true`
+
+### Why delete only on conflict, never truncate after `prev`
+Messages can arrive late. If I already have entries 5–7 from the leader and a delayed message arrives with `prev_log_index = 4, entries = [5]`, truncating after `prev` would throw away 6 and 7, which the leader may already be counting in `match_index`. Deleting only from the first conflict (same index, different term) never removes an entry the leader has.
+
+### Why `min` for `commit_index`
+`leader_commit` can be ahead of what I hold. If `leader_commit = 10` but I only match the leader up to 7, I can't call 8–10 committed: I don't have them yet. `commit_index` = highest entry known committed (safe to apply); how far I've applied to `Storage` is `last_applied`, a separate counter.
+
+### Why fsync before `true`
+The leader counts my `true` as a stored copy when deciding what's committed. If I crash and lose the entry, that majority was never real, and a "committed" entry can disappear.
+
+### What the leader does
+**On becoming leader**, for each follower: `next_index = my last log index + 1`, `match_index = 0`.
+
+**Sending to a follower** (every heartbeat, and straight away on a new entry):
+- `prev_log_index = next_index - 1`
+- `prev_log_term` = term of my entry at `prev_log_index` (0 if `prev_log_index` is 0)
+- `entries` = my log from `next_index` onwards (empty if the follower is caught up)
+
+**On the reply:**
+- `success: true` → `match_index = prev_log_index + entries.len()`, `next_index = match_index + 1`
+- `success: false`, reply term > mine → step down (universal rule)
+- `success: false` otherwise → `next_index -= 1` (never below 1) and retry
+
+**Commit rule:** entry N is committed when
+1. a majority, counting me, have `match_index ≥ N` *(for 3 nodes: the middle of my last index and the two `match_index` values)*, **and**
+2. `log[N].term == current_term`
+
+then `commit_index = N`. Followers learn it from `leader_commit` in the next AppendEntries; there's no separate commit message.
+
+**A client PUT/DELETE, in order:**
+1. Append `{current_term, command}` to my log
+2. fsync it
+3. Send AppendEntries to followers, in parallel
+4. Majority `success` → commit rule advances `commit_index`
+5. Apply to `Storage`
+6. Reply OK to the client
+
+### Applying (every node)
+While `last_applied < commit_index`: `last_applied += 1`, apply `log[last_applied]` to the Phase 1 `Storage`. Committing and applying are separate counters because they happen in different places: `commit_index` moves in RPC handling, applying runs after it.
+
+### Why only current-term entries are committed by counting (§5.4.2)
+An entry keeps the term it was created in. An old-term entry can be on a majority and still be overwritten. Example: S1 copies an old term-2 entry A to S3 while leading in term 4, so A is on 2 of 3. S2 holds a conflicting term-3 entry B in the same slot. If S1 crashes, S2's last term (3) beats S3's (2), so S3 votes for S2, which overwrites A. If S1 had already told the client OK, a committed write is lost.
+
+Waiting until an entry from S1's own term 4 is on a majority blocks this: S3's last term is then 4, which beats S2's 3, so S2 can't win. Committing that entry also commits A, since everything before a committed entry is committed. A write that is lost before it commits is fine: the client was never told it succeeded.
+
+## Replication decisions
+- **No-op on becoming leader.** A new leader appends an empty entry with its `current_term` straight away. By §5.4.2 it can't commit older-term entries until an entry from its own term commits; the no-op makes that happen without waiting for a client write.
+- **Raft log on disk.** Separate append-only file, same style as the Phase 1 WAL: `[term][op][key_len][key][val_len][val]`, fsync'd on append, replayed on startup. Truncating conflicting entries (receiver rule 4) rewrites the file from the conflict point.
+- **Client write to a follower.** Rejected with an error naming the current leader; the client retries there. No forwarding.
+- **Restarts apply entries twice — accepted for now.** `last_applied` is volatile and resets to 0, but `Storage` keeps its data through its own WAL, so replaying the log re-applies entries already in it. The final state is still correct (same entries, same order); while catching up, a key can briefly show an older value. A node only serves clients as leader, after applying up to `commit_index`. Proper fix: persist `last_applied` with `Storage`, or merge the Raft log and WAL (Phase 4, see DESIGN.md).
 
 ## Still unsure about
-- AppendEntries full semantics — `prev_log_index`/`prev_log_term` consistency check, how `entries[]` is reconciled, how `leader_commit` advances follower `commit_index`. Section 3 above.
-- `commit_index` / `last_applied` / `next_index` / `match_index` — know what they hold, not yet how they move. Read §5.3 before section 3.
+- Nothing blocking. Expect the details of rule 4 (finding the first conflict) and rewriting the log file to get clearer while implementing.
